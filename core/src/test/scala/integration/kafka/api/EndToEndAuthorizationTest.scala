@@ -300,14 +300,14 @@ abstract class EndToEndAuthorizationTest extends IntegrationTestHarness with Sas
   /**
     * Tests that producer, consumer and adminClient fail to publish messages, consume
     * messages and describe topics respectively when the describe ACL isn't set.
-    * Also verifies that subsequent publish, consume and describe to authorized topic succeeds.
+    * Also verifies that subsequent produce, consume and describe to authorized topic succeeds.
     */
   @ParameterizedTest(name = "{displayName}.groupProtocol={0}.isIdempotenceEnabled={1}")
   @CsvSource(value = Array(
     "classic, true",
-    //"consumer, true",
+    "consumer, true",
     "classic, false",
-    //"consumer, false",
+    "consumer, false",
   ))
   def testNoDescribeProduceOrConsumeWithoutTopicDescribeAcl(groupProtocol:String, isIdempotenceEnabled:Boolean): Unit = {
     // Set consumer group acls since we are testing topic authorization
@@ -340,7 +340,14 @@ abstract class EndToEndAuthorizationTest extends IntegrationTestHarness with Sas
 
     sendRecords(producer2, numRecords, tp2)
     consumer.assign(java.util.List.of(tp2))
-    consumeRecords(consumer, numRecords, topic = topic2)
+    if (groupProtocol.equalsIgnoreCase(GroupProtocol.CLASSIC.name)) {
+      consumeRecords(consumer, numRecords, topic = topic2)
+    } else {
+      // AsyncConsumer caches the prior assign(tp)'s TopicAuthorizationException in
+      // NetworkClientDelegate.metadataError; it leaks past the assign() boundary and
+      // surfaces on the first MetadataErrorNotifiableEvent of the new tp2 poll exactly once.
+      consumeRecordsIgnoreOneAuthorizationException(consumer, numRecords, topic = topic2)
+    }
     val describeResults = adminClient.describeTopics(java.util.Set.of(topic, topic2)).topicNameValues()
     assertEquals(1, describeResults.get(topic2).get().partitions().size())
 
@@ -358,8 +365,10 @@ abstract class EndToEndAuthorizationTest extends IntegrationTestHarness with Sas
       topic2RecordConsumed = true
       false
     }
+    // pollTimeoutMs must outlast the metadata refresh: an empty poll result would fail
+    // verifyNoRecords {tp2} partition assertion before the auth exception is thrown.
     assertThrows(classOf[TopicAuthorizationException],
-      () => TestUtils.pollRecordsUntilTrue(consumer, verifyNoRecords, "Consumer didn't fail with authorization exception within timeout"))
+      () => TestUtils.pollRecordsUntilTrue(consumer, verifyNoRecords, "Consumer didn't fail with authorization exception within timeout", pollTimeoutMs = 200))
 
     // Add ACLs and verify successful produce/consume/describe on first topic
     setReadAndWriteAcls(tp)
